@@ -1,12 +1,14 @@
 import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
 
 DEFAULT_URLS = [
-    "https://www.reddit.com/r/cars/new/.rss",
-    "https://www.reddit.com/r/projectcar/new/.rss",
     "https://www.reddit.com/r/FordMaverickTruck/new/.rss",
+    "https://www.reddit.com/r/FordMaverickTruckMods/new/.rss",
+    "https://www.mavericktruckclub.com/forum/",
+    "https://www.maverickchat.com/forums/2022-ford-maverick-general-discussion-forum.8/",
 ]
 
 DEFAULT_KEYWORDS = [
@@ -14,27 +16,41 @@ DEFAULT_KEYWORDS = [
     "intercooler",
     "transmission cooler",
     "oil cooler",
+    "cooling",
+    "overheating",
     "mishimoto",
+    "recommend",
+    "problem",
+    "issue",
 ]
+
+USER_AGENT = "web:forum-monitor:v1.0 (by /u/your_reddit_username)"
+
 
 st.set_page_config(page_title="Forum Monitor", layout="wide")
 st.title("Forum Monitor")
+st.write("Add RSS feeds or forum URLs, then scan for keyword matches.")
 
-st.write("Add RSS feed URLs and keywords, then click Scan URLs.")
 
 url_text = st.text_area(
     "URLs to check (one per line)",
     value="\n".join(DEFAULT_URLS),
-    height=160
+    height=180,
 )
 
 keyword_text = st.text_area(
     "Keywords to look for (one per line)",
     value="\n".join(DEFAULT_KEYWORDS),
-    height=160
+    height=180,
 )
 
-def match_keyword(text, keywords):
+
+def label_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.netloc}{parsed.path}"
+
+
+def match_keyword(text: str, keywords: list[str]) -> str | None:
     text = (text or "").lower()
     for kw in keywords:
         kw = kw.strip().lower()
@@ -42,32 +58,34 @@ def match_keyword(text, keywords):
             return kw
     return None
 
-def fetch_rss(url):
-    headers = {
-        "User-Agent": "web:forum-monitor:v1.0 (by /u/YOUR_REDDIT_USERNAME)"
-    }
-    r = requests.get(url, headers=headers, timeout=20)
-    r.raise_for_status()
-    return r.text
 
-def label_from_url(url):
-    parsed = urlparse(url)
-    return parsed.netloc + parsed.path
+def fetch_url(url: str) -> str:
+    headers = {"User-Agent": USER_AGENT}
+    response = requests.get(url, headers=headers, timeout=20)
+    response.raise_for_status()
+    return response.text
 
-def parse_rss(xml_text):
-    root = ET.fromstring(xml_text)
 
-    # RSS 2.0
+def parse_rss(xml_text: str) -> list[dict]:
     items = []
+
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return items
+
+    # RSS
     for item in root.findall(".//item"):
         title = item.findtext("title", default="")
         link = item.findtext("link", default="")
         description = item.findtext("description", default="")
-        items.append({
-            "title": title,
-            "link": link,
-            "body": description
-        })
+        items.append(
+            {
+                "title": title,
+                "link": link,
+                "body": description,
+            }
+        )
 
     # Atom fallback
     if not items:
@@ -84,13 +102,80 @@ def parse_rss(xml_text):
                     link = href
                     break
 
-            items.append({
-                "title": title,
-                "link": link,
-                "body": content or summary
-            })
+            items.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "body": content or summary,
+                }
+            )
 
     return items
+
+
+def parse_html(base_url: str, html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    seen_links = set()
+
+    for link in soup.find_all("a", href=True):
+        title = link.get_text(" ", strip=True)
+        href = link.get("href", "").strip()
+
+        if not title or not href:
+            continue
+
+        full_link = urljoin(base_url, href)
+
+        # Skip junk links
+        bad_starts = ("javascript:", "mailto:", "#")
+        if href.startswith(bad_starts):
+            continue
+
+        # Keep links on the same site only
+        if urlparse(full_link).netloc != urlparse(base_url).netloc:
+            continue
+
+        # Skip obvious navigation/account links
+        lower_title = title.lower()
+        if any(
+            junk in lower_title
+            for junk in [
+                "log in",
+                "register",
+                "menu",
+                "search",
+                "home",
+                "forums",
+                "new posts",
+                "members",
+                "latest",
+            ]
+        ):
+            continue
+
+        if full_link in seen_links:
+            continue
+
+        seen_links.add(full_link)
+
+        items.append(
+            {
+                "title": title,
+                "link": full_link,
+                "body": title,
+            }
+        )
+
+    return items
+
+
+def parse_content(url: str, content: str) -> list[dict]:
+    lower_url = url.lower()
+    if lower_url.endswith(".rss") or "/rss" in lower_url:
+        return parse_rss(content)
+    return parse_html(url, content)
+
 
 if st.button("Scan URLs"):
     urls = [u.strip() for u in url_text.splitlines() if u.strip()]
@@ -100,34 +185,38 @@ if st.button("Scan URLs"):
 
     for url in urls:
         try:
-            xml_text = fetch_rss(url)
-            items = parse_rss(xml_text)
+            content = fetch_url(url)
+            items = parse_content(url, content)
 
             for item in items:
-                text = f'{item["title"]} {item["body"]}'
-                keyword = match_keyword(text, keywords)
+                combined_text = f'{item.get("title", "")} {item.get("body", "")}'
+                keyword = match_keyword(combined_text, keywords)
 
                 if keyword:
-                    results.append({
-                        "source": label_from_url(url),
-                        "keyword": keyword,
-                        "title": item["title"] or "Match found",
-                        "link": item["link"],
-                        "snippet": (item["body"] or "")[:300]
-                    })
+                    results.append(
+                        {
+                            "source": label_from_url(url),
+                            "keyword": keyword,
+                            "title": item.get("title", "Match found"),
+                            "link": item.get("link", ""),
+                            "snippet": (item.get("body", "") or "")[:300],
+                        }
+                    )
 
         except Exception as e:
             st.error(f"Error checking {url}: {e}")
 
     if results:
         st.success(f"Found {len(results)} matches")
+
         for item in results:
             st.subheader(item["title"])
             st.write(f'**Source:** {item["source"]}')
             st.write(f'**Keyword:** {item["keyword"]}')
             if item["snippet"]:
                 st.write(item["snippet"])
-            st.markdown(f'[Open Match]({item["link"]})')
+            if item["link"]:
+                st.markdown(f'[Open Match]({item["link"]})')
             st.divider()
     else:
         st.info("No matches found.")
