@@ -1,50 +1,43 @@
 import re
 import time
-from urllib.parse import urljoin, urlparse, quote_plus
+from urllib.parse import urlparse
 
-import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+# ----------------------------
+# Config
+# ----------------------------
 
-st.set_page_config(page_title="Keyword Forum Monitor", layout="wide")
+st.set_page_config(page_title="Keyword URL Finder + Scraper", layout="wide")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-REQUEST_TIMEOUT = 12
-MAX_SEARCH_RESULTS = 20
-DEFAULT_EXCLUDE_DOMAINS = [
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    )
+}
+
+BLOCKED_DOMAINS = {
+    "google.com",
     "youtube.com",
     "facebook.com",
     "instagram.com",
+    "twitter.com",
+    "x.com",
+    "tiktok.com",
     "linkedin.com",
     "pinterest.com",
-    "tiktok.com",
+    "reddit.com",
     "amazon.com",
-]
-DEFAULT_INCLUDE_HINTS = [
-    "forum",
-    "community",
-    "discussion",
-    "thread",
-    "board",
-    "club",
-    "owners",
-]
+    "ebay.com",
+}
 
-
-# -----------------------------
+# ----------------------------
 # Helpers
-# -----------------------------
-def get_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    return session
-
+# ----------------------------
 
 def normalize_url(url: str) -> str:
     url = url.strip()
@@ -55,62 +48,94 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text
-
-
-def domain_of(url: str) -> str:
+def clean_domain(url: str) -> str:
     try:
         return urlparse(url).netloc.lower().replace("www.", "")
     except Exception:
         return ""
 
 
-def looks_relevant(url: str, title: str, snippet: str, keywords: list[str], include_hints: list[str]) -> bool:
-    haystack = f"{url} {title} {snippet}".lower()
-    keyword_hit = any(k.lower() in haystack for k in keywords if k.strip())
-    hint_hit = any(h.lower() in haystack for h in include_hints if h.strip())
-    return keyword_hit and hint_hit
+def domain_allowed(url: str) -> bool:
+    host = clean_domain(url)
+    if not host:
+        return False
+
+    for blocked in BLOCKED_DOMAINS:
+        if host == blocked or host.endswith("." + blocked):
+            return False
+    return True
 
 
-def search_duckduckgo(query: str, max_results: int = 10) -> list[dict]:
+def looks_relevant(url: str, title: str, keyword: str) -> bool:
+    blob = f"{url} {title}".lower()
+    keyword = keyword.lower().strip()
+
+    if keyword in blob:
+        return True
+
+    parts = [p for p in re.split(r"[\s\-_\/]+", keyword) if p]
+    matches = sum(1 for p in parts if p in blob)
+
+    return matches >= 1
+
+
+def extract_real_url(href: str) -> str:
     """
-    Uses the DuckDuckGo HTML endpoint. This is a pragmatic option for a lightweight app,
-    but search result markup can change, so keep this parser simple.
+    Handle DuckDuckGo result links.
     """
-    session = get_session()
-    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    if not href:
+        return ""
+
+    href = href.strip()
+
+    # direct URL
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+
+    return href
+
+
+def search_duckduckgo(keyword: str, max_results: int = 15):
+    query = f"{keyword} forum OR board OR discussion OR club OR blog OR community"
+    url = "https://html.duckduckgo.com/html/"
+    params = {"q": query}
+
+    response = requests.get(url, params=params, headers=HEADERS, timeout=20)
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+
     results = []
-
-    try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return [{"title": "Search error", "url": "", "snippet": str(e)}]
-
-    soup = BeautifulSoup(resp.text, "html.parser")
     seen = set()
 
-    for block in soup.select(".result"):
-        link = block.select_one(".result__title a")
-        snippet = block.select_one(".result__snippet")
-        if not link:
+    for result in soup.select(".result"):
+        link_tag = result.select_one(".result__a")
+        if not link_tag:
             continue
 
-        href = link.get("href", "").strip()
-        title = clean_text(link.get_text(" ", strip=True))
-        desc = clean_text(snippet.get_text(" ", strip=True) if snippet else "")
+        href = link_tag.get("href", "").strip()
+        title = link_tag.get_text(" ", strip=True)
 
-        if not href or href in seen:
+        real_url = extract_real_url(href)
+        real_url = normalize_url(real_url)
+
+        if not real_url:
             continue
-        seen.add(href)
+        if real_url in seen:
+            continue
+        if not domain_allowed(real_url):
+            continue
+        if not looks_relevant(real_url, title, keyword):
+            continue
 
-        results.append({
-            "title": title,
-            "url": href,
-            "snippet": desc,
-        })
+        seen.add(real_url)
+        results.append(
+            {
+                "title": title or real_url,
+                "url": real_url,
+                "domain": clean_domain(real_url),
+            }
+        )
 
         if len(results) >= max_results:
             break
@@ -118,186 +143,198 @@ def search_duckduckgo(query: str, max_results: int = 10) -> list[dict]:
     return results
 
 
-def discover_candidate_urls(keyword_phrase: str, max_results: int = 20) -> list[dict]:
-    keywords = [k for k in re.split(r"\s+", keyword_phrase.strip()) if k]
-    search_queries = [
-        f'{keyword_phrase} forum',
-        f'{keyword_phrase} discussion',
-        f'{keyword_phrase} community',
-        f'{keyword_phrase} site:reddit.com',
-    ]
+def get_page_text(url: str) -> str:
+    response = requests.get(url, headers=HEADERS, timeout=20)
+    response.raise_for_status()
 
-    merged = []
-    seen_urls = set()
+    soup = BeautifulSoup(response.text, "html.parser")
 
-    for query in search_queries:
-        for item in search_duckduckgo(query, max_results=max_results):
-            url = item.get("url", "")
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            item["matched_query"] = query
-            item["relevant"] = looks_relevant(
-                url=url,
-                title=item.get("title", ""),
-                snippet=item.get("snippet", ""),
-                keywords=keywords,
-                include_hints=DEFAULT_INCLUDE_HINTS,
-            )
-            merged.append(item)
+    for tag in soup(["script", "style", "noscript", "svg", "img"]):
+        tag.decompose()
 
-    return merged[:max_results]
+    text = soup.get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+    return text
 
 
-def fetch_page(url: str) -> dict:
-    session = get_session()
-    url = normalize_url(url)
+def build_snippet(text: str, keyword: str, radius: int = 180) -> str:
+    if not text:
+        return ""
 
+    lower_text = text.lower()
+    lower_keyword = keyword.lower().strip()
+
+    idx = lower_text.find(lower_keyword)
+    if idx == -1:
+        return text[:400].strip()
+
+    start = max(0, idx - radius)
+    end = min(len(text), idx + len(keyword) + radius)
+    return text[start:end].strip()
+
+
+def scrape_url(url: str, keyword: str):
     try:
-        resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
-            return {"url": url, "ok": False, "error": f"Skipped non-HTML content: {content_type}"}
+        response = requests.get(url, headers=HEADERS, timeout=20)
+        response.raise_for_status()
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(response.text, "html.parser")
+        page_title = soup.title.get_text(" ", strip=True) if soup.title else url
 
-        for tag in soup(["script", "style", "noscript", "svg"]):
+        for tag in soup(["script", "style", "noscript", "svg", "img"]):
             tag.decompose()
 
-        title = clean_text(soup.title.get_text(" ", strip=True) if soup.title else "")
-        text = clean_text(soup.get_text(" ", strip=True))
-        links = []
-        for a in soup.select("a[href]"):
-            href = a.get("href", "").strip()
-            absolute = urljoin(resp.url, href)
-            anchor = clean_text(a.get_text(" ", strip=True))
-            if absolute.startswith("http"):
-                links.append({"anchor": anchor, "url": absolute})
+        text = soup.get_text(" ", strip=True)
+        text = re.sub(r"\s+", " ", text)
+
+        keyword_clean = keyword.lower().strip()
+        mention_count = text.lower().count(keyword_clean) if keyword_clean else 0
+        snippet = build_snippet(text, keyword)
 
         return {
-            "url": resp.url,
-            "ok": True,
-            "title": title,
-            "text": text,
-            "links": links,
+            "url": url,
+            "title": page_title,
+            "mentions": mention_count,
+            "snippet": snippet,
+            "word_count": len(text.split()),
+            "status": "ok",
         }
-    except requests.RequestException as e:
-        return {"url": url, "ok": False, "error": str(e)}
+
+    except Exception as e:
+        return {
+            "url": url,
+            "title": url,
+            "mentions": 0,
+            "snippet": "",
+            "word_count": 0,
+            "status": f"error: {e}",
+        }
 
 
-def extract_keyword_mentions(text: str, keywords: list[str], window: int = 180) -> list[str]:
-    matches = []
-    lowered = text.lower()
-
-    for keyword in keywords:
-        k = keyword.lower().strip()
-        if not k:
-            continue
-        for m in re.finditer(re.escape(k), lowered):
-            start = max(0, m.start() - window)
-            end = min(len(text), m.end() + window)
-            snippet = clean_text(text[start:end])
-            if snippet and snippet not in matches:
-                matches.append(snippet)
-            if len(matches) >= 25:
-                return matches
-    return matches
-
-
-def score_page(page: dict, keyword_phrase: str) -> dict:
-    keywords = [k for k in re.split(r"\s+", keyword_phrase.strip()) if k]
-    title = page.get("title", "")
-    text = page.get("text", "")
-    combined = f"{title} {text}".lower()
-
-    keyword_hits = sum(combined.count(k.lower()) for k in keywords if k)
-    title_boost = sum(3 for k in keywords if k.lower() in title.lower())
-    forum_boost = 2 if any(h in combined for h in DEFAULT_INCLUDE_HINTS) else 0
-    score = keyword_hits + title_boost + forum_boost
-
-    mentions = extract_keyword_mentions(text, keywords)
-
-    return {
-        "url": page.get("url", ""),
-        "title": title,
-        "score": score,
-        "mention_count": len(mentions),
-        "mentions": mentions,
-    }
-
-
-def scrape_and_analyze(urls: list[str], keyword_phrase: str, delay_seconds: float = 0.6) -> tuple[list[dict], list[dict]]:
-    page_results = []
-    score_results = []
-
-    for url in urls:
-        page = fetch_page(url)
-        page_results.append(page)
-
-        if page.get("ok"):
-            scored = score_page(page, keyword_phrase)
-            score_results.append(scored)
-
-        time.sleep(delay_seconds)
-
-    score_results.sort(key=lambda x: (x["score"], x["mention_count"]), reverse=True)
-    return page_results, score_results
-
-
-def filter_discovered_urls(items: list[dict], excluded_domains: list[str]) -> list[dict]:
-    filtered = []
-    for item in items:
-        url = item.get("url", "")
-        domain = domain_of(url)
-        if any(excl in domain for excl in excluded_domains):
-            continue
-        filtered.append(item)
-    return filtered
-
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("Keyword-Based Website Discovery + Scraper")
-st.caption(
-    "Enter a keyword or topic, discover relevant forum/community URLs, then scrape and inspect pages that mention it."
-)
+# ----------------------------
+# Session State
+# ----------------------------
 
 if "discovered_urls" not in st.session_state:
     st.session_state.discovered_urls = []
-if "selected_urls" not in st.session_state:
-    st.session_state.selected_urls = []
-if "analysis_results" not in st.session_state:
-    st.session_state.analysis_results = []
-if "page_results" not in st.session_state:
-    st.session_state.page_results = []
 
-with st.sidebar:
-    st.header("Settings")
-    max_discovery = st.number_input("Max discovered URLs", min_value=5, max_value=50, value=15, step=1)
-    crawl_delay = st.number_input("Delay between page requests (seconds)", min_value=0.0, max_value=5.0, value=0.6, step=0.1)
-    excluded_input = st.text_area(
-        "Exclude domains (one per line)",
-        value="\n".join(DEFAULT_EXCLUDE_DOMAINS),
-        help="Useful for skipping social sites or stores when you only want forums, communities, and discussion pages.",
-    )
-    excluded_domains = [x.strip().lower() for x in excluded_input.splitlines() if x.strip()]
+if "scrape_results" not in st.session_state:
+    st.session_state.scrape_results = []
 
-keyword_phrase = st.text_input(
-    "Keyword or topic",
-    placeholder="Ford Maverick, RAM RHO, Tacoma intercooler, etc.",
-    key="keyword_phrase",
+if "search_error" not in st.session_state:
+    st.session_state.search_error = ""
+
+# ----------------------------
+# UI
+# ----------------------------
+
+st.title("Keyword URL Finder + Scraper")
+st.write("Enter a keyword, find matching URLs, then scrape selected pages to see mentions and snippets.")
+
+keyword = st.text_input(
+    "Keyword",
+    placeholder="Ford Maverick, Ram RHO, Tacoma intercooler, ceramic coating, etc."
 )
 
-col1, col2 = st.columns([1, 1])
+max_results = st.slider("Number of URLs to find", min_value=5, max_value=30, value=15)
+
+col1, col2 = st.columns(2)
 
 with col1:
-    discover_clicked = st.button("Find matching URLs", use_container_width=True)
+    if st.button("Find Matching URLs", use_container_width=True):
+        st.session_state.discovered_urls = []
+        st.session_state.scrape_results = []
+        st.session_state.search_error = ""
+
+        if not keyword.strip():
+            st.session_state.search_error = "Please enter a keyword first."
+        else:
+            with st.spinner("Searching for matching URLs..."):
+                try:
+                    results = search_duckduckgo(keyword, max_results=max_results)
+                    st.session_state.discovered_urls = results
+
+                    if not results:
+                        st.session_state.search_error = (
+                            "No matching URLs found. Try a broader keyword."
+                        )
+                except Exception as e:
+                    st.session_state.search_error = f"Search failed: {e}"
+
 with col2:
-    scrape_clicked = st.button("Scrape selected URLs", use_container_width=True)
+    if st.button("Clear Results", use_container_width=True):
+        st.session_state.discovered_urls = []
+        st.session_state.scrape_results = []
+        st.session_state.search_error = ""
 
+if st.session_state.search_error:
+    st.warning(st.session_state.search_error)
 
-if discover_clicked:
-    if not keyword_phrase.strip():
-        st.warning("Enter a keyword or topic first.")
+# ----------------------------
+# Show discovered URLs
+# ----------------------------
+
+if st.session_state.discovered_urls:
+    st.subheader("Discovered URLs")
+
+    options = [item["url"] for item in st.session_state.discovered_urls]
+    labels = {
+        item["url"]: f'{item["title"]} ({item["domain"]})'
+        for item in st.session_state.discovered_urls
+    }
+
+    default_selection = options[:5] if len(options) >= 5 else options
+
+    selected_urls = st.multiselect(
+        "Choose URLs to scrape",
+        options=options,
+        default=default_selection,
+        format_func=lambda x: labels.get(x, x),
+        key="selected_urls",
+    )
+
+    with st.expander("See all found URLs"):
+        for item in st.session_state.discovered_urls:
+            st.write(f"- {item['title']}")
+            st.write(item["url"])
+
+    if st.button("Scrape Selected URLs", use_container_width=True):
+        if not selected_urls:
+            st.warning("Select at least one URL to scrape.")
+        else:
+            results = []
+            progress = st.progress(0)
+
+            with st.spinner("Scraping selected URLs..."):
+                total = len(selected_urls)
+
+                for i, url in enumerate(selected_urls, start=1):
+                    results.append(scrape_url(url, keyword))
+                    progress.progress(i / total)
+                    time.sleep(1)
+
+            st.session_state.scrape_results = results
+
+# ----------------------------
+# Show scrape results
+# ----------------------------
+
+if st.session_state.scrape_results:
+    st.subheader("Scrape Results")
+
+    sorted_results = sorted(
+        st.session_state.scrape_results,
+        key=lambda x: (x["status"] != "ok", -x["mentions"]),
+    )
+
+    for item in sorted_results:
+        st.markdown(f"### {item['title']}")
+        st.write(item["url"])
+        st.write(f"**Status:** {item['status']}")
+        st.write(f"**Mentions:** {item['mentions']}")
+        st.write(f"**Word Count:** {item['word_count']}")
+
+        if item["snippet"]:
+            st.caption(item["snippet"])
+
+        st.divider()
