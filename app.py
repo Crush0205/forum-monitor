@@ -1,36 +1,172 @@
-import streamlit as st
+import re
+import time
+from collections import Counter, defaultdict
+from urllib.parse import urljoin, urlparse
+
+import pandas as pd
 import requests
-import xml.etree.ElementTree as ET
-from urllib.parse import urlparse, urljoin
+import streamlit as st
 from bs4 import BeautifulSoup
 
-DEFAULT_URLS = [
-    "Enter URL"
+# ---------------------------------
+# App Config
+# ---------------------------------
+
+st.set_page_config(page_title="Demand Finder", layout="wide")
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+
+HEADERS = {"User-Agent": USER_AGENT}
+
+BLOCKED_DOMAINS = {
+    "google.com",
+    "youtube.com",
+    "facebook.com",
+    "instagram.com",
+    "linkedin.com",
+    "twitter.com",
+    "x.com",
+    "tiktok.com",
+    "pinterest.com",
+    "amazon.com",
+    "ebay.com",
+    "wikipedia.org",
+}
+
+STOPWORDS = {
+    "the", "and", "for", "with", "that", "this", "from", "have", "your",
+    "about", "just", "they", "them", "what", "when", "where", "would",
+    "there", "their", "into", "than", "then", "were", "been", "will",
+    "make", "more", "some", "very", "also", "here", "over", "does",
+    "need", "looking", "look", "help", "best", "good", "great", "much",
+    "really", "like", "site", "page", "forum", "club", "community",
+    "discussion", "thread", "post", "posts", "want", "which", "using",
+    "used", "after", "before", "still", "getting", "got", "said", "says",
+    "because", "into", "onto", "only", "same", "each", "many", "most",
+    "other", "these", "those", "than", "could", "should", "being", "while",
+    "ever", "even", "any", "our", "out", "all", "can", "you", "how", "why",
+    "is", "are", "was", "were", "be", "to", "of", "in", "on", "a", "an",
+}
+
+PAIN_POINT_PATTERNS = [
+    r"\bproblem\b",
+    r"\bissue\b",
+    r"\bissues\b",
+    r"\bbroken\b",
+    r"\bfail\b",
+    r"\bfailing\b",
+    r"\bfailure\b",
+    r"\boverheat\b",
+    r"\boverheating\b",
+    r"\bleak\b",
+    r"\bleaking\b",
+    r"\bcrack\b",
+    r"\bcracked\b",
+    r"\bwon't\b",
+    r"\bdoesn't\b",
+    r"\bnot working\b",
+    r"\bneed to fix\b",
+    r"\bannoying\b",
+    r"\bhate\b",
+    r"\bfrustrat",
+    r"\bstruggling\b",
+    r"\bslow\b",
+    r"\bweak\b",
+    r"\bbad\b",
+    r"\bunreliable\b",
+    r"\bnoise\b",
+    r"\bvibration\b",
+    r"\bheat soak\b",
+]
+
+BUYING_SIGNAL_PATTERNS = [
+    r"\bbest\b",
+    r"\brecommend\b",
+    r"\brecommendation\b",
+    r"\bworth it\b",
+    r"\bwhich one\b",
+    r"\bwhat should i buy\b",
+    r"\bthinking about buying\b",
+    r"\bready to buy\b",
+    r"\bcompare\b",
+    r"\bcomparison\b",
+    r"\bprice\b",
+    r"\bcost\b",
+    r"\bafford\b",
+    r"\bdiscount\b",
+    r"\bsale\b",
+    r"\bwhere can i buy\b",
+    r"\bwho makes\b",
+    r"\blooking for\b",
+]
+
+QUESTION_PATTERNS = [
+    r"\?$",
+    r"\bhow do i\b",
+    r"\bwhat is the best\b",
+    r"\banyone know\b",
+    r"\bhas anyone\b",
+    r"\bshould i\b",
+    r"\bworth\b",
+]
+
+COMMERCIAL_TERMS = [
+    "price", "cost", "buy", "order", "shipping", "lead time", "install",
+    "vs", "versus", "review", "reviews", "recommend", "best", "worth",
+    "discount", "sale",
 ]
 
 DEFAULT_KEYWORDS = [
-    "Enter Keywords"
+    "Ford Maverick",
+    "RAM RHO",
+    "Tacoma intercooler",
 ]
 
-USER_AGENT = "web:forum-monitor:v1.0 (by /u/your_reddit_username)"
+# ---------------------------------
+# Session State
+# ---------------------------------
+
+for key, default in {
+    "discovered_urls": [],
+    "raw_mentions": [],
+    "dashboard_rows": [],
+    "search_error": "",
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+# ---------------------------------
+# Utility Functions
+# ---------------------------------
+
+def normalize_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
 
 
-st.set_page_config(page_title="Forum Monitor", layout="wide")
-st.title("Forum Monitor")
-st.write("Add RSS feeds or forum URLs, then scan for keyword matches.")
+def clean_domain(url: str) -> str:
+    try:
+        return urlparse(url).netloc.lower().replace("www.", "")
+    except Exception:
+        return ""
 
 
-url_text = st.text_area(
-    "URLs to check (one per line)",
-    value="\n".join(DEFAULT_URLS),
-    height=180,
-)
-
-keyword_text = st.text_area(
-    "Keywords to look for (one per line)",
-    value="\n".join(DEFAULT_KEYWORDS),
-    height=180,
-)
+def domain_allowed(url: str) -> bool:
+    domain = clean_domain(url)
+    if not domain:
+        return False
+    for blocked in BLOCKED_DOMAINS:
+        if domain == blocked or domain.endswith("." + blocked):
+            return False
+    return True
 
 
 def label_from_url(url: str) -> str:
@@ -38,173 +174,564 @@ def label_from_url(url: str) -> str:
     return f"{parsed.netloc}{parsed.path}"
 
 
-def match_keyword(text: str, keywords: list[str]) -> str | None:
-    text = (text or "").lower()
-    for kw in keywords:
-        kw = kw.strip().lower()
-        if kw and kw in text:
-            return kw
-    return None
-
-
 def fetch_url(url: str) -> str:
-    headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
-    return response.text
+    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+    return resp.text
 
 
-def parse_rss(xml_text: str) -> list[dict]:
-    items = []
+def clean_text(text: str) -> str:
+    text = BeautifulSoup(text or "", "html.parser").get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-    try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return items
 
-    # RSS
-    for item in root.findall(".//item"):
-        title = item.findtext("title", default="")
-        link = item.findtext("link", default="")
-        description = item.findtext("description", default="")
-        items.append(
+def extract_real_url(href: str) -> str:
+    if not href:
+        return ""
+    href = href.strip()
+    if href.startswith(("http://", "https://")):
+        return href
+    return href
+
+
+def looks_relevant(url: str, title: str, keyword: str) -> bool:
+    blob = f"{url} {title}".lower()
+    keyword = keyword.lower().strip()
+
+    if keyword in blob:
+        return True
+
+    parts = [p for p in re.split(r"[\s\-_\/]+", keyword) if p]
+    if not parts:
+        return False
+
+    matches = sum(1 for p in parts if p in blob)
+    return matches >= 1
+
+
+def search_duckduckgo(keyword: str, max_results: int = 20) -> list[dict]:
+    query = f'{keyword} forum OR board OR discussion OR club OR community OR blog'
+    search_url = "https://html.duckduckgo.com/html/"
+    resp = requests.get(search_url, params={"q": query}, headers=HEADERS, timeout=20)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    results = []
+    seen = set()
+
+    for result in soup.select(".result"):
+        link_tag = result.select_one(".result__a")
+        if not link_tag:
+            continue
+
+        href = link_tag.get("href", "").strip()
+        title = clean_text(link_tag.get_text(" ", strip=True))
+        url = normalize_url(extract_real_url(href))
+
+        if not url or url in seen:
+            continue
+        if not domain_allowed(url):
+            continue
+        if not looks_relevant(url, title, keyword):
+            continue
+
+        seen.add(url)
+        results.append(
             {
-                "title": title,
-                "link": link,
-                "body": description,
+                "title": title or url,
+                "url": url,
+                "domain": clean_domain(url),
+                "source_type": "discovered",
             }
         )
 
-    # Atom fallback
-    if not items:
-        ns = {"atom": "http://www.w3.org/2005/Atom"}
-        for entry in root.findall(".//atom:entry", ns):
-            title = entry.findtext("atom:title", default="", namespaces=ns)
-            content = entry.findtext("atom:content", default="", namespaces=ns)
-            summary = entry.findtext("atom:summary", default="", namespaces=ns)
+        if len(results) >= max_results:
+            break
 
-            link = ""
-            for link_el in entry.findall("atom:link", ns):
-                href = link_el.attrib.get("href", "")
-                if href:
-                    link = href
-                    break
-
-            items.append(
-                {
-                    "title": title,
-                    "link": link,
-                    "body": content or summary,
-                }
-            )
-
-    return items
+    return results
 
 
-def parse_html(base_url: str, html: str) -> list[dict]:
+def parse_html_links(base_url: str, html: str, max_links: int = 25) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
-    items = []
-    seen_links = set()
+    links = []
+    seen = set()
+    base_domain = clean_domain(base_url)
 
-    for link in soup.find_all("a", href=True):
-        title = link.get_text(" ", strip=True)
-        href = link.get("href", "").strip()
-
-        if not title or not href:
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+        if href.startswith(("javascript:", "mailto:", "#")):
             continue
 
-        full_link = urljoin(base_url, href)
-
-        # Skip junk links
-        bad_starts = ("javascript:", "mailto:", "#")
-        if href.startswith(bad_starts):
+        full = urljoin(base_url, href)
+        if clean_domain(full) != base_domain:
+            continue
+        if full in seen:
             continue
 
-        # Keep links on the same site only
-        if urlparse(full_link).netloc != urlparse(base_url).netloc:
-            continue
+        text = clean_text(a.get_text(" ", strip=True)).lower()
 
-        # Skip obvious navigation/account links
-        lower_title = title.lower()
-        if any(
-            junk in lower_title
-            for junk in [
-                "log in",
-                "register",
-                "menu",
-                "search",
-                "home",
-                "forums",
-                "new posts",
-                "members",
-                "latest",
+        # Try to favor pages that look like threads, articles, or discussions
+        good = any(
+            token in full.lower() or token in text
+            for token in [
+                "thread", "forum", "discussion", "topic", "post", "article",
+                "blog", "review", "questions", "faq", "community"
             ]
-        ):
-            continue
-
-        if full_link in seen_links:
-            continue
-
-        seen_links.add(full_link)
-
-        items.append(
-            {
-                "title": title,
-                "link": full_link,
-                "body": title,
-            }
         )
 
-    return items
+        if good:
+            seen.add(full)
+            links.append(full)
+
+        if len(links) >= max_links:
+            break
+
+    return links
 
 
-def parse_content(url: str, content: str) -> list[dict]:
-    lower_url = url.lower()
-    if lower_url.endswith(".rss") or "/rss" in lower_url:
-        return parse_rss(content)
-    return parse_html(url, content)
+def extract_page_title(soup: BeautifulSoup, fallback: str) -> str:
+    if soup.title:
+        return clean_text(soup.title.get_text(" ", strip=True))
+    h1 = soup.find("h1")
+    if h1:
+        return clean_text(h1.get_text(" ", strip=True))
+    return fallback
 
 
-if st.button("Scan URLs"):
-    urls = [u.strip() for u in url_text.splitlines() if u.strip()]
-    keywords = [k.strip() for k in keyword_text.splitlines() if k.strip()]
+def extract_snippet(text: str, keyword: str, radius: int = 180) -> str:
+    lower_text = text.lower()
+    lower_kw = keyword.lower().strip()
+    if lower_kw and lower_kw in lower_text:
+        idx = lower_text.find(lower_kw)
+        start = max(0, idx - radius)
+        end = min(len(text), idx + len(keyword) + radius)
+        return text[start:end].strip()
+    return text[:400].strip()
 
+
+def split_sentences(text: str) -> list[str]:
+    sentences = re.split(r"(?<=[\.\?\!])\s+", text)
+    return [s.strip() for s in sentences if len(s.strip()) > 20]
+
+
+def classify_sentence(sentence: str) -> dict:
+    s = sentence.lower()
+
+    pain = any(re.search(p, s) for p in PAIN_POINT_PATTERNS)
+    buying = any(re.search(p, s) for p in BUYING_SIGNAL_PATTERNS)
+    question = any(re.search(p, s) for p in QUESTION_PATTERNS) or s.endswith("?")
+
+    return {
+        "pain_point": pain,
+        "buying_signal": buying,
+        "question": question,
+    }
+
+
+def tokenize_topics(text: str) -> list[str]:
+    words = re.findall(r"[a-zA-Z0-9\+\-]{3,}", text.lower())
+    words = [w for w in words if w not in STOPWORDS and not w.isdigit()]
+    return words
+
+
+def top_topics_from_mentions(mentions: list[dict], n: int = 15) -> list[tuple[str, int]]:
+    counter = Counter()
+    for m in mentions:
+        counter.update(tokenize_topics(m.get("title", "")))
+        counter.update(tokenize_topics(m.get("snippet", "")))
+    return counter.most_common(n)
+
+
+def score_demand(mention_count: int, pain_count: int, buying_count: int, question_count: int) -> int:
+    score = (mention_count * 1) + (pain_count * 3) + (buying_count * 4) + (question_count * 2)
+    return int(score)
+
+
+def scrape_single_page(url: str, keyword: str) -> dict | None:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for tag in soup(["script", "style", "noscript", "svg", "img"]):
+            tag.decompose()
+
+        title = extract_page_title(soup, url)
+        text = clean_text(soup.get_text(" ", strip=True))
+        if not text:
+            return None
+
+        kw = keyword.lower().strip()
+        mentions = text.lower().count(kw) if kw else 0
+        snippet = extract_snippet(text, keyword)
+
+        sentences = split_sentences(text)
+        classified = [classify_sentence(s) for s in sentences]
+
+        pain_count = sum(1 for c in classified if c["pain_point"])
+        buying_count = sum(1 for c in classified if c["buying_signal"])
+        question_count = sum(1 for c in classified if c["question"])
+
+        demand_score = score_demand(mentions, pain_count, buying_count, question_count)
+
+        return {
+            "url": url,
+            "title": title,
+            "keyword": keyword,
+            "domain": clean_domain(url),
+            "mentions": mentions,
+            "pain_points": pain_count,
+            "buying_signals": buying_count,
+            "questions": question_count,
+            "demand_score": demand_score,
+            "snippet": snippet,
+            "status": "ok",
+            "word_count": len(text.split()),
+        }
+
+    except Exception as e:
+        return {
+            "url": url,
+            "title": url,
+            "keyword": keyword,
+            "domain": clean_domain(url),
+            "mentions": 0,
+            "pain_points": 0,
+            "buying_signals": 0,
+            "questions": 0,
+            "demand_score": 0,
+            "snippet": "",
+            "status": f"error: {e}",
+            "word_count": 0,
+        }
+
+
+def crawl_seed_url(seed_url: str, keyword: str, pages_per_site: int = 5, pause_seconds: float = 0.6) -> list[dict]:
     results = []
 
-    for url in urls:
+    try:
+        seed_html = fetch_url(seed_url)
+    except Exception as e:
+        return [{
+            "url": seed_url,
+            "title": seed_url,
+            "keyword": keyword,
+            "domain": clean_domain(seed_url),
+            "mentions": 0,
+            "pain_points": 0,
+            "buying_signals": 0,
+            "questions": 0,
+            "demand_score": 0,
+            "snippet": "",
+            "status": f"error: {e}",
+            "word_count": 0,
+        }]
+
+    visited = set()
+    queue = [seed_url] + parse_html_links(seed_url, seed_html, max_links=pages_per_site * 2)
+
+    for url in queue:
+        if len(results) >= pages_per_site:
+            break
+        if url in visited:
+            continue
+
+        visited.add(url)
+        row = scrape_single_page(url, keyword)
+        if row:
+            results.append(row)
+
+        time.sleep(pause_seconds)
+
+    return results
+
+
+def summarize_opportunities(df: pd.DataFrame) -> list[str]:
+    if df.empty:
+        return []
+
+    insights = []
+
+    high_buying = df[df["buying_signals"] > 0].sort_values("buying_signals", ascending=False)
+    if not high_buying.empty:
+        top = high_buying.iloc[0]
+        insights.append(
+            f"Strongest buying intent is on {top['domain']} around '{top['keyword']}' with {int(top['buying_signals'])} buying-signal hits."
+        )
+
+    high_pain = df[df["pain_points"] > 0].sort_values("pain_points", ascending=False)
+    if not high_pain.empty:
+        top = high_pain.iloc[0]
+        insights.append(
+            f"Biggest pain-point signal is on {top['domain']} where discussion around '{top['keyword']}' is showing {int(top['pain_points'])} friction indicators."
+        )
+
+    high_questions = df[df["questions"] > 0].sort_values("questions", ascending=False)
+    if not high_questions.empty:
+        top = high_questions.iloc[0]
+        insights.append(
+            f"The best content opportunity is likely FAQ or comparison content, with {int(top['questions'])} question-style signals on {top['domain']}."
+        )
+
+    best = df.sort_values("demand_score", ascending=False).head(3)
+    if not best.empty:
+        domains = ", ".join(best["domain"].dropna().astype(str).head(3).tolist())
+        insights.append(
+            f"Highest-priority domains to monitor or target next: {domains}."
+        )
+
+    return insights
+
+
+# ---------------------------------
+# Sidebar
+# ---------------------------------
+
+st.title("Demand Finder")
+st.write("Discover what people are asking for, complaining about, and getting ready to buy.")
+
+with st.sidebar:
+    st.header("Settings")
+    max_discovery = st.slider("Max discovered URLs per keyword", 5, 30, 12)
+    pages_per_site = st.slider("Pages to scrape per site", 1, 10, 4)
+    pause_seconds = st.slider("Pause between page requests", 0.0, 2.0, 0.5, 0.1)
+    auto_discover = st.checkbox("Auto-discover URLs from keywords", value=True)
+    st.caption("Use a pause to reduce the chance of getting blocked.")
+
+# ---------------------------------
+# Inputs
+# ---------------------------------
+
+col1, col2 = st.columns([1.2, 1])
+
+with col1:
+    keyword_text = st.text_area(
+        "Keywords to track",
+        value="\n".join(DEFAULT_KEYWORDS),
+        height=160,
+        help="One keyword or product/market phrase per line.",
+    )
+
+with col2:
+    manual_url_text = st.text_area(
+        "Optional URLs to include",
+        value="",
+        height=160,
+        help="Add any sites or forums you already know matter.",
+    )
+
+keywords = [k.strip() for k in keyword_text.splitlines() if k.strip()]
+manual_urls = [normalize_url(u.strip()) for u in manual_url_text.splitlines() if u.strip()]
+
+# ---------------------------------
+# Discovery
+# ---------------------------------
+
+if st.button("Find Demand", use_container_width=True):
+    st.session_state.discovered_urls = []
+    st.session_state.raw_mentions = []
+    st.session_state.dashboard_rows = []
+    st.session_state.search_error = ""
+
+    all_targets = []
+
+    with st.spinner("Finding relevant websites and discussion pages..."):
         try:
-            content = fetch_url(url)
-            items = parse_content(url, content)
+            for kw in keywords:
+                if auto_discover:
+                    discovered = search_duckduckgo(kw, max_results=max_discovery)
+                    for item in discovered:
+                        item["keyword"] = kw
+                    all_targets.extend(discovered)
 
-            for item in items:
-                combined_text = f'{item.get("title", "")} {item.get("body", "")}'
-                keyword = match_keyword(combined_text, keywords)
-
-                if keyword:
-                    results.append(
+            for url in manual_urls:
+                if url:
+                    all_targets.append(
                         {
-                            "source": label_from_url(url),
-                            "keyword": keyword,
-                            "title": item.get("title", "Match found"),
-                            "link": item.get("link", ""),
-                            "snippet": (item.get("body", "") or "")[:300],
+                            "title": url,
+                            "url": url,
+                            "domain": clean_domain(url),
+                            "source_type": "manual",
+                            "keyword": "manual",
                         }
                     )
 
+            deduped = []
+            seen = set()
+            for item in all_targets:
+                key = (item["url"], item.get("keyword", ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+
+            st.session_state.discovered_urls = deduped
+
         except Exception as e:
-            st.error(f"Error checking {url}: {e}")
+            st.session_state.search_error = f"Discovery failed: {e}"
 
-    if results:
-        st.success(f"Found {len(results)} matches")
+    if not st.session_state.discovered_urls:
+        st.warning("No URLs found. Try broader keywords or add a few manual URLs.")
 
-        for item in results:
-            st.subheader(item["title"])
-            st.write(f'**Source:** {item["source"]}')
-            st.write(f'**Keyword:** {item["keyword"]}')
-            if item["snippet"]:
-                st.write(item["snippet"])
-            if item["link"]:
-                st.markdown(f'[Open Match]({item["link"]})')
-            st.divider()
+# ---------------------------------
+# Show Targets
+# ---------------------------------
+
+if st.session_state.search_error:
+    st.error(st.session_state.search_error)
+
+if st.session_state.discovered_urls:
+    st.subheader("Discovered Targets")
+
+    discovered_df = pd.DataFrame(st.session_state.discovered_urls)
+    st.dataframe(
+        discovered_df[["keyword", "domain", "title", "url", "source_type"]],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    options = [f"{item['keyword']} | {item['url']}" for item in st.session_state.discovered_urls]
+    option_map = {f"{item['keyword']} | {item['url']}": item for item in st.session_state.discovered_urls}
+
+    selected = st.multiselect(
+        "Choose targets to scrape",
+        options=options,
+        default=options[: min(8, len(options))],
+    )
+
+    if st.button("Scrape and Analyze", use_container_width=True):
+        raw_rows = []
+
+        with st.spinner("Scraping pages and scoring demand..."):
+            for key in selected:
+                item = option_map[key]
+                site_results = crawl_seed_url(
+                    seed_url=item["url"],
+                    keyword=item["keyword"],
+                    pages_per_site=pages_per_site,
+                    pause_seconds=pause_seconds,
+                )
+                raw_rows.extend(site_results)
+
+        st.session_state.raw_mentions = raw_rows
+        st.session_state.dashboard_rows = raw_rows
+
+# ---------------------------------
+# Dashboard
+# ---------------------------------
+
+if st.session_state.dashboard_rows:
+    df = pd.DataFrame(st.session_state.dashboard_rows)
+
+    ok_df = df[df["status"] == "ok"].copy()
+
+    st.subheader("Demand Dashboard")
+
+    if ok_df.empty:
+        st.info("Scrape completed, but no readable pages returned data.")
     else:
-        st.info("No matches found.")
+        metric1, metric2, metric3, metric4 = st.columns(4)
+        metric1.metric("Pages analyzed", len(ok_df))
+        metric2.metric("Buying signals", int(ok_df["buying_signals"].sum()))
+        metric3.metric("Pain points", int(ok_df["pain_points"].sum()))
+        metric4.metric("Questions", int(ok_df["questions"].sum()))
+
+        domain_rollup = (
+            ok_df.groupby("domain", dropna=False)
+            .agg(
+                pages=("url", "count"),
+                mentions=("mentions", "sum"),
+                pain_points=("pain_points", "sum"),
+                buying_signals=("buying_signals", "sum"),
+                questions=("questions", "sum"),
+                demand_score=("demand_score", "sum"),
+            )
+            .reset_index()
+            .sort_values("demand_score", ascending=False)
+        )
+
+        keyword_rollup = (
+            ok_df.groupby("keyword", dropna=False)
+            .agg(
+                pages=("url", "count"),
+                mentions=("mentions", "sum"),
+                pain_points=("pain_points", "sum"),
+                buying_signals=("buying_signals", "sum"),
+                questions=("questions", "sum"),
+                demand_score=("demand_score", "sum"),
+            )
+            .reset_index()
+            .sort_values("demand_score", ascending=False)
+        )
+
+        top_topics = top_topics_from_mentions(st.session_state.raw_mentions, n=20)
+        topic_df = pd.DataFrame(top_topics, columns=["topic", "count"])
+
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "Opportunities",
+            "Domains",
+            "Keywords",
+            "Raw Mentions",
+        ])
+
+        with tab1:
+            st.markdown("### What looks commercially interesting")
+            for insight in summarize_opportunities(ok_df):
+                st.write(f"- {insight}")
+
+            st.markdown("### Top topics showing up")
+            if not topic_df.empty:
+                st.dataframe(topic_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No topics extracted.")
+
+            st.markdown("### Highest-demand pages")
+            top_pages = ok_df.sort_values("demand_score", ascending=False)[[
+                "keyword", "domain", "title", "mentions",
+                "pain_points", "buying_signals", "questions", "demand_score", "url"
+            ]].head(20)
+            st.dataframe(top_pages, use_container_width=True, hide_index=True)
+
+        with tab2:
+            st.markdown("### Demand by domain")
+            st.dataframe(domain_rollup, use_container_width=True, hide_index=True)
+
+        with tab3:
+            st.markdown("### Demand by keyword")
+            st.dataframe(keyword_rollup, use_container_width=True, hide_index=True)
+
+        with tab4:
+            st.markdown("### Raw page-level signals")
+            raw_view = ok_df[[
+                "keyword", "domain", "title", "mentions",
+                "pain_points", "buying_signals", "questions",
+                "demand_score", "snippet", "url"
+            ]].sort_values("demand_score", ascending=False)
+            st.dataframe(raw_view, use_container_width=True, hide_index=True)
+
+        csv = ok_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download raw demand data as CSV",
+            data=csv,
+            file_name="demand_finder_results.csv",
+            mime="text/csv",
+        )
+
+# ---------------------------------
+# Footer Guidance
+# ---------------------------------
+
+with st.expander("How to use this well"):
+    st.write(
+        """
+        - Enter products, problems, or vehicle/platform names.
+        - Add known forums or niche communities if you already know the space.
+        - Look for pages with high buying-signal counts and high question counts.
+        - Look for pain-point clusters to guide content, product positioning, or new offers.
+        - Use the keyword and domain tabs to see where demand is concentrated.
+        """
+    )
