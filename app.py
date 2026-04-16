@@ -1,340 +1,210 @@
-import re
-import time
-from urllib.parse import urlparse
-
-import requests
 import streamlit as st
+import requests
+import xml.etree.ElementTree as ET
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 
-# ----------------------------
-# Config
-# ----------------------------
+DEFAULT_URLS = [
+    "Enter URL"
+]
 
-st.set_page_config(page_title="Keyword URL Finder + Scraper", layout="wide")
+DEFAULT_KEYWORDS = [
+    "Enter Keywords"
+]
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0 Safari/537.36"
-    )
-}
-
-BLOCKED_DOMAINS = {
-    "google.com",
-    "youtube.com",
-    "facebook.com",
-    "instagram.com",
-    "twitter.com",
-    "x.com",
-    "tiktok.com",
-    "linkedin.com",
-    "pinterest.com",
-    "reddit.com",
-    "amazon.com",
-    "ebay.com",
-}
-
-# ----------------------------
-# Helpers
-# ----------------------------
-
-def normalize_url(url: str) -> str:
-    url = url.strip()
-    if not url:
-        return ""
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    return url
+USER_AGENT = "web:forum-monitor:v1.0 (by /u/your_reddit_username)"
 
 
-def clean_domain(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower().replace("www.", "")
-    except Exception:
-        return ""
+st.set_page_config(page_title="Forum Monitor", layout="wide")
+st.title("Forum Monitor")
+st.write("Add RSS feeds or forum URLs, then scan for keyword matches.")
 
 
-def domain_allowed(url: str) -> bool:
-    host = clean_domain(url)
-    if not host:
-        return False
+url_text = st.text_area(
+    "URLs to check (one per line)",
+    value="\n".join(DEFAULT_URLS),
+    height=180,
+)
 
-    for blocked in BLOCKED_DOMAINS:
-        if host == blocked or host.endswith("." + blocked):
-            return False
-    return True
-
-
-def looks_relevant(url: str, title: str, keyword: str) -> bool:
-    blob = f"{url} {title}".lower()
-    keyword = keyword.lower().strip()
-
-    if keyword in blob:
-        return True
-
-    parts = [p for p in re.split(r"[\s\-_\/]+", keyword) if p]
-    matches = sum(1 for p in parts if p in blob)
-
-    return matches >= 1
+keyword_text = st.text_area(
+    "Keywords to look for (one per line)",
+    value="\n".join(DEFAULT_KEYWORDS),
+    height=180,
+)
 
 
-def extract_real_url(href: str) -> str:
-    """
-    Handle DuckDuckGo result links.
-    """
-    if not href:
-        return ""
-
-    href = href.strip()
-
-    # direct URL
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-
-    return href
+def label_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.netloc}{parsed.path}"
 
 
-def search_duckduckgo(keyword: str, max_results: int = 15):
-    query = f"{keyword} forum OR board OR discussion OR club OR blog OR community"
-    url = "https://html.duckduckgo.com/html/"
-    params = {"q": query}
+def match_keyword(text: str, keywords: list[str]) -> str | None:
+    text = (text or "").lower()
+    for kw in keywords:
+        kw = kw.strip().lower()
+        if kw and kw in text:
+            return kw
+    return None
 
-    response = requests.get(url, params=params, headers=HEADERS, timeout=20)
+
+def fetch_url(url: str) -> str:
+    headers = {"User-Agent": USER_AGENT}
+    response = requests.get(url, headers=headers, timeout=20)
     response.raise_for_status()
+    return response.text
 
-    soup = BeautifulSoup(response.text, "html.parser")
 
-    results = []
-    seen = set()
+def parse_rss(xml_text: str) -> list[dict]:
+    items = []
 
-    for result in soup.select(".result"):
-        link_tag = result.select_one(".result__a")
-        if not link_tag:
-            continue
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return items
 
-        href = link_tag.get("href", "").strip()
-        title = link_tag.get_text(" ", strip=True)
-
-        real_url = extract_real_url(href)
-        real_url = normalize_url(real_url)
-
-        if not real_url:
-            continue
-        if real_url in seen:
-            continue
-        if not domain_allowed(real_url):
-            continue
-        if not looks_relevant(real_url, title, keyword):
-            continue
-
-        seen.add(real_url)
-        results.append(
+    # RSS
+    for item in root.findall(".//item"):
+        title = item.findtext("title", default="")
+        link = item.findtext("link", default="")
+        description = item.findtext("description", default="")
+        items.append(
             {
-                "title": title or real_url,
-                "url": real_url,
-                "domain": clean_domain(real_url),
+                "title": title,
+                "link": link,
+                "body": description,
             }
         )
 
-        if len(results) >= max_results:
-            break
+    # Atom fallback
+    if not items:
+        ns = {"atom": "http://www.w3.org/2005/Atom"}
+        for entry in root.findall(".//atom:entry", ns):
+            title = entry.findtext("atom:title", default="", namespaces=ns)
+            content = entry.findtext("atom:content", default="", namespaces=ns)
+            summary = entry.findtext("atom:summary", default="", namespaces=ns)
 
-    return results
+            link = ""
+            for link_el in entry.findall("atom:link", ns):
+                href = link_el.attrib.get("href", "")
+                if href:
+                    link = href
+                    break
 
+            items.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "body": content or summary,
+                }
+            )
 
-def get_page_text(url: str) -> str:
-    response = requests.get(url, headers=HEADERS, timeout=20)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "svg", "img"]):
-        tag.decompose()
-
-    text = soup.get_text(" ", strip=True)
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def build_snippet(text: str, keyword: str, radius: int = 180) -> str:
-    if not text:
-        return ""
-
-    lower_text = text.lower()
-    lower_keyword = keyword.lower().strip()
-
-    idx = lower_text.find(lower_keyword)
-    if idx == -1:
-        return text[:400].strip()
-
-    start = max(0, idx - radius)
-    end = min(len(text), idx + len(keyword) + radius)
-    return text[start:end].strip()
+    return items
 
 
-def scrape_url(url: str, keyword: str):
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=20)
-        response.raise_for_status()
+def parse_html(base_url: str, html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+    seen_links = set()
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        page_title = soup.title.get_text(" ", strip=True) if soup.title else url
+    for link in soup.find_all("a", href=True):
+        title = link.get_text(" ", strip=True)
+        href = link.get("href", "").strip()
 
-        for tag in soup(["script", "style", "noscript", "svg", "img"]):
-            tag.decompose()
+        if not title or not href:
+            continue
 
-        text = soup.get_text(" ", strip=True)
-        text = re.sub(r"\s+", " ", text)
+        full_link = urljoin(base_url, href)
 
-        keyword_clean = keyword.lower().strip()
-        mention_count = text.lower().count(keyword_clean) if keyword_clean else 0
-        snippet = build_snippet(text, keyword)
+        # Skip junk links
+        bad_starts = ("javascript:", "mailto:", "#")
+        if href.startswith(bad_starts):
+            continue
 
-        return {
-            "url": url,
-            "title": page_title,
-            "mentions": mention_count,
-            "snippet": snippet,
-            "word_count": len(text.split()),
-            "status": "ok",
-        }
+        # Keep links on the same site only
+        if urlparse(full_link).netloc != urlparse(base_url).netloc:
+            continue
 
-    except Exception as e:
-        return {
-            "url": url,
-            "title": url,
-            "mentions": 0,
-            "snippet": "",
-            "word_count": 0,
-            "status": f"error: {e}",
-        }
+        # Skip obvious navigation/account links
+        lower_title = title.lower()
+        if any(
+            junk in lower_title
+            for junk in [
+                "log in",
+                "register",
+                "menu",
+                "search",
+                "home",
+                "forums",
+                "new posts",
+                "members",
+                "latest",
+            ]
+        ):
+            continue
+
+        if full_link in seen_links:
+            continue
+
+        seen_links.add(full_link)
+
+        items.append(
+            {
+                "title": title,
+                "link": full_link,
+                "body": title,
+            }
+        )
+
+    return items
 
 
-# ----------------------------
-# Session State
-# ----------------------------
+def parse_content(url: str, content: str) -> list[dict]:
+    lower_url = url.lower()
+    if lower_url.endswith(".rss") or "/rss" in lower_url:
+        return parse_rss(content)
+    return parse_html(url, content)
 
-if "discovered_urls" not in st.session_state:
-    st.session_state.discovered_urls = []
 
-if "scrape_results" not in st.session_state:
-    st.session_state.scrape_results = []
+if st.button("Scan URLs"):
+    urls = [u.strip() for u in url_text.splitlines() if u.strip()]
+    keywords = [k.strip() for k in keyword_text.splitlines() if k.strip()]
 
-if "search_error" not in st.session_state:
-    st.session_state.search_error = ""
+    results = []
 
-# ----------------------------
-# UI
-# ----------------------------
+    for url in urls:
+        try:
+            content = fetch_url(url)
+            items = parse_content(url, content)
 
-st.title("Keyword URL Finder + Scraper")
-st.write("Enter a keyword, find matching URLs, then scrape selected pages to see mentions and snippets.")
+            for item in items:
+                combined_text = f'{item.get("title", "")} {item.get("body", "")}'
+                keyword = match_keyword(combined_text, keywords)
 
-keyword = st.text_input(
-    "Keyword",
-    placeholder="Ford Maverick, Ram RHO, Tacoma intercooler, ceramic coating, etc."
-)
+                if keyword:
+                    results.append(
+                        {
+                            "source": label_from_url(url),
+                            "keyword": keyword,
+                            "title": item.get("title", "Match found"),
+                            "link": item.get("link", ""),
+                            "snippet": (item.get("body", "") or "")[:300],
+                        }
+                    )
 
-max_results = st.slider("Number of URLs to find", min_value=5, max_value=30, value=15)
+        except Exception as e:
+            st.error(f"Error checking {url}: {e}")
 
-col1, col2 = st.columns(2)
+    if results:
+        st.success(f"Found {len(results)} matches")
 
-with col1:
-    if st.button("Find Matching URLs", use_container_width=True):
-        st.session_state.discovered_urls = []
-        st.session_state.scrape_results = []
-        st.session_state.search_error = ""
-
-        if not keyword.strip():
-            st.session_state.search_error = "Please enter a keyword first."
-        else:
-            with st.spinner("Searching for matching URLs..."):
-                try:
-                    results = search_duckduckgo(keyword, max_results=max_results)
-                    st.session_state.discovered_urls = results
-
-                    if not results:
-                        st.session_state.search_error = (
-                            "No matching URLs found. Try a broader keyword."
-                        )
-                except Exception as e:
-                    st.session_state.search_error = f"Search failed: {e}"
-
-with col2:
-    if st.button("Clear Results", use_container_width=True):
-        st.session_state.discovered_urls = []
-        st.session_state.scrape_results = []
-        st.session_state.search_error = ""
-
-if st.session_state.search_error:
-    st.warning(st.session_state.search_error)
-
-# ----------------------------
-# Show discovered URLs
-# ----------------------------
-
-if st.session_state.discovered_urls:
-    st.subheader("Discovered URLs")
-
-    options = [item["url"] for item in st.session_state.discovered_urls]
-    labels = {
-        item["url"]: f'{item["title"]} ({item["domain"]})'
-        for item in st.session_state.discovered_urls
-    }
-
-    default_selection = options[:5] if len(options) >= 5 else options
-
-    selected_urls = st.multiselect(
-        "Choose URLs to scrape",
-        options=options,
-        default=default_selection,
-        format_func=lambda x: labels.get(x, x),
-        key="selected_urls",
-    )
-
-    with st.expander("See all found URLs"):
-        for item in st.session_state.discovered_urls:
-            st.write(f"- {item['title']}")
-            st.write(item["url"])
-
-    if st.button("Scrape Selected URLs", use_container_width=True):
-        if not selected_urls:
-            st.warning("Select at least one URL to scrape.")
-        else:
-            results = []
-            progress = st.progress(0)
-
-            with st.spinner("Scraping selected URLs..."):
-                total = len(selected_urls)
-
-                for i, url in enumerate(selected_urls, start=1):
-                    results.append(scrape_url(url, keyword))
-                    progress.progress(i / total)
-                    time.sleep(1)
-
-            st.session_state.scrape_results = results
-
-# ----------------------------
-# Show scrape results
-# ----------------------------
-
-if st.session_state.scrape_results:
-    st.subheader("Scrape Results")
-
-    sorted_results = sorted(
-        st.session_state.scrape_results,
-        key=lambda x: (x["status"] != "ok", -x["mentions"]),
-    )
-
-    for item in sorted_results:
-        st.markdown(f"### {item['title']}")
-        st.write(item["url"])
-        st.write(f"**Status:** {item['status']}")
-        st.write(f"**Mentions:** {item['mentions']}")
-        st.write(f"**Word Count:** {item['word_count']}")
-
-        if item["snippet"]:
-            st.caption(item["snippet"])
-
-        st.divider()
+        for item in results:
+            st.subheader(item["title"])
+            st.write(f'**Source:** {item["source"]}')
+            st.write(f'**Keyword:** {item["keyword"]}')
+            if item["snippet"]:
+                st.write(item["snippet"])
+            if item["link"]:
+                st.markdown(f'[Open Match]({item["link"]})')
+            st.divider()
+    else:
+        st.info("No matches found.")
