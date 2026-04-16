@@ -72,6 +72,32 @@ QUESTION_PATTERNS = [
     r"\bhas anyone\b", r"\bshould i\b", r"\bworth\b",
 ]
 
+THREAD_HINTS = [
+    "/thread", "/threads", "/topic", "/topics", "/discussion", "/discussions",
+    "/forum", "/forums", "/community", "/communities", "/post", "/posts",
+    "/article", "/articles", "/review", "/reviews", "/question", "/questions",
+    "/faq", "/board", "/boards"
+]
+
+BAD_LINK_HINTS = [
+    "login", "sign-in", "signin", "register", "account", "privacy", "terms",
+    "contact", "about", "cart", "checkout", "wishlist", "support", "help",
+    "javascript:", "mailto:", "#"
+]
+
+BLOCKED_PAGE_SIGNALS = [
+    "access denied",
+    "forbidden",
+    "enable javascript",
+    "verify you are human",
+    "captcha",
+    "cloudflare",
+    "bot check",
+    "please enable cookies",
+    "checking if the site connection is secure",
+    "temporarily blocked",
+]
+
 DEFAULT_KEYWORDS = [
     "Ford Maverick",
     "RAM RHO",
@@ -119,8 +145,12 @@ def domain_allowed(url: str) -> bool:
     return True
 
 
+def fetch_response(url: str):
+    return requests.get(url, headers=HEADERS, timeout=20, allow_redirects=True)
+
+
 def fetch_url(url: str) -> str:
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    resp = fetch_response(url)
     resp.raise_for_status()
     return resp.text
 
@@ -141,9 +171,6 @@ def extract_real_url(href: str) -> str:
 
 
 def looks_relevant(url: str, title: str, keyword: str) -> bool:
-    """
-    Looser filter than before.
-    """
     blob = f"{url} {title}".lower()
     keyword = keyword.lower().strip()
 
@@ -158,22 +185,17 @@ def looks_relevant(url: str, title: str, keyword: str) -> bool:
         return True
 
     matches = sum(1 for p in parts if p in blob)
-
-    # was too strict before
     return matches >= 1
 
 
 def discover_with_bing_rss(keyword: str, max_results: int = 15) -> list[dict]:
-    """
-    Uses Bing's RSS result format, which is easier to parse than scraping HTML SERPs.
-    """
     query = f"{keyword} forum OR discussion OR community OR club OR blog"
     rss_url = f"https://www.bing.com/search?format=rss&q={quote_plus(query)}"
 
     results = []
     seen = set()
 
-    resp = requests.get(rss_url, headers=HEADERS, timeout=20)
+    resp = fetch_response(rss_url)
     resp.raise_for_status()
 
     root = ET.fromstring(resp.text)
@@ -212,12 +234,12 @@ def discover_with_duckduckgo(keyword: str, max_results: int = 15) -> list[dict]:
     results = []
     seen = set()
 
+    resp = fetch_response(search_url)
     resp = requests.get(search_url, params={"q": query}, headers=HEADERS, timeout=20)
     resp.raise_for_status()
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # Try multiple selectors
     candidates = soup.select(".result__a")
     if not candidates:
         candidates = soup.select("a[href]")
@@ -233,8 +255,6 @@ def discover_with_duckduckgo(keyword: str, max_results: int = 15) -> list[dict]:
             continue
         if not domain_allowed(url):
             continue
-
-        # Only apply relevance if we actually have a title or meaningful URL
         if title or url:
             if not looks_relevant(url, title, keyword):
                 continue
@@ -256,9 +276,6 @@ def discover_with_duckduckgo(keyword: str, max_results: int = 15) -> list[dict]:
 
 
 def discover_urls(keyword: str, max_results: int = 15) -> list[dict]:
-    """
-    Try Bing RSS first, then DDG fallback.
-    """
     results = []
 
     try:
@@ -288,11 +305,39 @@ def discover_urls(keyword: str, max_results: int = 15) -> list[dict]:
     return deduped[:max_results]
 
 
+def score_link_candidate(base_url: str, full_url: str, anchor_text: str) -> int:
+    score = 0
+    url_lower = full_url.lower()
+    text_lower = (anchor_text or "").lower()
+
+    if clean_domain(full_url) != clean_domain(base_url):
+        return -999
+
+    if any(bad in url_lower for bad in BAD_LINK_HINTS):
+        return -50
+
+    if any(hint in url_lower for hint in THREAD_HINTS):
+        score += 6
+
+    if any(hint in text_lower for hint in ["thread", "discussion", "forum", "post", "topic", "review", "question"]):
+        score += 4
+
+    if re.search(r"/\d{4}/|\d{2,}", url_lower):
+        score += 2
+
+    if len(anchor_text or "") > 20:
+        score += 1
+
+    if url_lower.rstrip("/") == base_url.lower().rstrip("/"):
+        score -= 3
+
+    return score
+
+
 def parse_html_links(base_url: str, html: str, max_links: int = 25) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
-    links = []
+    candidates = []
     seen = set()
-    base_domain = clean_domain(base_url)
 
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
@@ -302,30 +347,18 @@ def parse_html_links(base_url: str, html: str, max_links: int = 25) -> list[str]
             continue
 
         full = urljoin(base_url, href)
-        if clean_domain(full) != base_domain:
-            continue
         if full in seen:
             continue
+        seen.add(full)
 
-        text = clean_text(a.get_text(" ", strip=True)).lower()
+        text = clean_text(a.get_text(" ", strip=True))
+        score = score_link_candidate(base_url, full, text)
 
-        good = any(
-            token in full.lower() or token in text
-            for token in [
-                "thread", "forum", "discussion", "topic", "post", "article",
-                "blog", "review", "questions", "faq", "community"
-            ]
-        )
+        if score > 0:
+            candidates.append((score, full))
 
-        # Also allow general internal links if we're not getting enough
-        if good or len(links) < 8:
-            seen.add(full)
-            links.append(full)
-
-        if len(links) >= max_links:
-            break
-
-    return links
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    return [url for _, url in candidates[:max_links]]
 
 
 def extract_page_title(soup: BeautifulSoup, fallback: str) -> str:
@@ -384,19 +417,86 @@ def score_demand(mention_count: int, pain_count: int, buying_count: int, questio
     return int((mention_count * 1) + (pain_count * 3) + (buying_count * 4) + (question_count * 2))
 
 
-def scrape_single_page(url: str, keyword: str) -> dict | None:
+def scrape_single_page(url: str, keyword: str) -> dict:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp = fetch_response(url)
         resp.raise_for_status()
 
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if "text/html" not in content_type:
+            return {
+                "url": url,
+                "title": url,
+                "keyword": keyword,
+                "domain": clean_domain(url),
+                "mentions": 0,
+                "pain_points": 0,
+                "buying_signals": 0,
+                "questions": 0,
+                "demand_score": 0,
+                "snippet": "",
+                "status": f"non-html content: {content_type or 'unknown'}",
+                "word_count": 0,
+            }
+
         soup = BeautifulSoup(resp.text, "html.parser")
+
         for tag in soup(["script", "style", "noscript", "svg", "img"]):
             tag.decompose()
 
         title = extract_page_title(soup, url)
         text = clean_text(soup.get_text(" ", strip=True))
+        word_count = len(text.split()) if text else 0
+        lower_text = text.lower() if text else ""
+
+        for signal in BLOCKED_PAGE_SIGNALS:
+            if signal in lower_text:
+                return {
+                    "url": url,
+                    "title": title,
+                    "keyword": keyword,
+                    "domain": clean_domain(url),
+                    "mentions": 0,
+                    "pain_points": 0,
+                    "buying_signals": 0,
+                    "questions": 0,
+                    "demand_score": 0,
+                    "snippet": text[:250] if text else "",
+                    "status": f"blocked page: {signal}",
+                    "word_count": word_count,
+                }
+
         if not text:
-            return None
+            return {
+                "url": url,
+                "title": title,
+                "keyword": keyword,
+                "domain": clean_domain(url),
+                "mentions": 0,
+                "pain_points": 0,
+                "buying_signals": 0,
+                "questions": 0,
+                "demand_score": 0,
+                "snippet": "",
+                "status": "empty page text",
+                "word_count": 0,
+            }
+
+        if word_count < 80:
+            return {
+                "url": url,
+                "title": title,
+                "keyword": keyword,
+                "domain": clean_domain(url),
+                "mentions": 0,
+                "pain_points": 0,
+                "buying_signals": 0,
+                "questions": 0,
+                "demand_score": 0,
+                "snippet": text[:250],
+                "status": "not enough readable text",
+                "word_count": word_count,
+            }
 
         kw = keyword.lower().strip()
         mentions = text.lower().count(kw) if kw else 0
@@ -423,7 +523,7 @@ def scrape_single_page(url: str, keyword: str) -> dict | None:
             "demand_score": demand_score,
             "snippet": snippet,
             "status": "ok",
-            "word_count": len(text.split()),
+            "word_count": word_count,
         }
 
     except Exception as e:
@@ -465,7 +565,7 @@ def crawl_seed_url(seed_url: str, keyword: str, pages_per_site: int = 4, pause_s
         }]
 
     visited = set()
-    queue = [seed_url] + parse_html_links(seed_url, seed_html, max_links=pages_per_site * 3)
+    queue = [seed_url] + parse_html_links(seed_url, seed_html, max_links=pages_per_site * 4)
 
     for url in queue:
         if len(results) >= pages_per_site:
@@ -475,9 +575,7 @@ def crawl_seed_url(seed_url: str, keyword: str, pages_per_site: int = 4, pause_s
 
         visited.add(url)
         row = scrape_single_page(url, keyword)
-        if row:
-            results.append(row)
-
+        results.append(row)
         time.sleep(pause_seconds)
 
     return results
@@ -528,6 +626,7 @@ with st.sidebar:
     pause_seconds = st.slider("Pause between page requests", 0.0, 2.0, 0.5, 0.1)
     auto_discover = st.checkbox("Auto-discover URLs from keywords", value=True)
     show_debug = st.checkbox("Show debug panel", value=True)
+    show_status_table = st.checkbox("Show scrape status table", value=True)
 
 col1, col2 = st.columns([1.2, 1])
 
@@ -643,12 +742,20 @@ else:
 
 if st.session_state.dashboard_rows:
     df = pd.DataFrame(st.session_state.dashboard_rows)
-    ok_df = df[df["status"] == "ok"].copy()
 
     st.subheader("Demand Dashboard")
 
+    if show_status_table:
+        st.markdown("### Scrape Status")
+        status_view = df[[
+            "keyword", "domain", "title", "status", "word_count", "url"
+        ]].sort_values(["status", "word_count"], ascending=[True, False])
+        st.dataframe(status_view, use_container_width=True, hide_index=True)
+
+    ok_df = df[df["status"] == "ok"].copy()
+
     if ok_df.empty:
-        st.warning("Pages were scraped, but none returned readable content.")
+        st.warning("No readable discussion pages were found. Check the Scrape Status table above.")
     else:
         metric1, metric2, metric3, metric4 = st.columns(4)
         metric1.metric("Pages analyzed", len(ok_df))
