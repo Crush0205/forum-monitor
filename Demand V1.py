@@ -5,23 +5,11 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 
 DEFAULT_URLS = [
-    "https://www.reddit.com/r/FordMaverickTruck/new/.rss",
-    "https://www.reddit.com/r/FordMaverickTruckMods/new/.rss",
-    "https://www.mavericktruckclub.com/forum/",
-    "https://www.maverickchat.com/forums/2022-ford-maverick-general-discussion-forum.8/",
+   "Enter URL"
 ]
 
 DEFAULT_KEYWORDS = [
-    "radiator",
-    "intercooler",
-    "transmission cooler",
-    "oil cooler",
-    "cooling",
-    "overheating",
-    "mishimoto",
-    "recommend",
-    "problem",
-    "issue",
+ "Enter Keyword"
 ]
 
 USER_AGENT = "web:forum-monitor:v1.0 (by /u/your_reddit_username)"

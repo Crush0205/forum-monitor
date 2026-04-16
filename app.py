@@ -76,7 +76,7 @@ THREAD_HINTS = [
     "/thread", "/threads", "/topic", "/topics", "/discussion", "/discussions",
     "/forum", "/forums", "/community", "/communities", "/post", "/posts",
     "/article", "/articles", "/review", "/reviews", "/question", "/questions",
-    "/faq", "/board", "/boards"
+    "/faq", "/board", "/boards", "/comments/"
 ]
 
 BAD_LINK_HINTS = [
@@ -143,6 +143,18 @@ def domain_allowed(url: str) -> bool:
         if domain == blocked or domain.endswith("." + blocked):
             return False
     return True
+
+
+def is_reddit_url(url: str) -> bool:
+    domain = clean_domain(url)
+    return domain.endswith("reddit.com")
+
+
+def reddit_rss_url(url: str) -> str:
+    base = url.rstrip("/")
+    if base.endswith(".rss"):
+        return base
+    return base + "/.rss"
 
 
 def fetch_response(url: str):
@@ -234,7 +246,6 @@ def discover_with_duckduckgo(keyword: str, max_results: int = 15) -> list[dict]:
     results = []
     seen = set()
 
-    resp = fetch_response(search_url)
     resp = requests.get(search_url, params={"q": query}, headers=HEADERS, timeout=20)
     resp.raise_for_status()
 
@@ -417,12 +428,138 @@ def score_demand(mention_count: int, pain_count: int, buying_count: int, questio
     return int((mention_count * 1) + (pain_count * 3) + (buying_count * 4) + (question_count * 2))
 
 
+def parse_xml_feed(xml_text: str) -> tuple[str, str]:
+    """
+    Return (title, combined_text) from RSS/Atom feed content.
+    """
+    root = ET.fromstring(xml_text)
+
+    feed_title = ""
+    texts = []
+
+    channel_title = root.findtext(".//channel/title")
+    if channel_title:
+        feed_title = clean_text(channel_title)
+
+    if not feed_title:
+        atom_title = root.findtext(".//{http://www.w3.org/2005/Atom}title")
+        if atom_title:
+            feed_title = clean_text(atom_title)
+
+    for item in root.findall(".//item"):
+        t = clean_text(item.findtext("title", default=""))
+        d = clean_text(item.findtext("description", default=""))
+        if t or d:
+            texts.append(f"{t} {d}".strip())
+
+    atom_ns = "{http://www.w3.org/2005/Atom}"
+    for entry in root.findall(f".//{atom_ns}entry"):
+        t = clean_text(entry.findtext(f"{atom_ns}title", default=""))
+        summary = clean_text(entry.findtext(f"{atom_ns}summary", default=""))
+        content = clean_text(entry.findtext(f"{atom_ns}content", default=""))
+        if t or summary or content:
+            texts.append(f"{t} {summary} {content}".strip())
+
+    return feed_title, " ".join(texts).strip()
+
+
 def scrape_single_page(url: str, keyword: str) -> dict:
     try:
-        resp = fetch_response(url)
+        request_url = url
+
+        # Prefer RSS for Reddit thread pages because it is often more reliable than HTML scraping.
+        if is_reddit_url(url) and "/comments/" in url and not url.rstrip("/").endswith(".rss"):
+            request_url = reddit_rss_url(url)
+            log_debug(f"Converted Reddit thread to RSS: {request_url}")
+
+        resp = fetch_response(request_url)
         resp.raise_for_status()
 
         content_type = resp.headers.get("Content-Type", "").lower()
+
+        # Handle RSS / Atom / XML feeds as valid content.
+        if "xml" in content_type or "rss" in content_type or "atom" in content_type:
+            try:
+                feed_title, text = parse_xml_feed(resp.text)
+                title = feed_title or request_url
+                word_count = len(text.split()) if text else 0
+
+                if not text:
+                    return {
+                        "url": url,
+                        "title": title,
+                        "keyword": keyword,
+                        "domain": clean_domain(url),
+                        "mentions": 0,
+                        "pain_points": 0,
+                        "buying_signals": 0,
+                        "questions": 0,
+                        "demand_score": 0,
+                        "snippet": "",
+                        "status": "rss empty",
+                        "word_count": 0,
+                    }
+
+                if word_count < 40:
+                    return {
+                        "url": url,
+                        "title": title,
+                        "keyword": keyword,
+                        "domain": clean_domain(url),
+                        "mentions": 0,
+                        "pain_points": 0,
+                        "buying_signals": 0,
+                        "questions": 0,
+                        "demand_score": 0,
+                        "snippet": text[:250],
+                        "status": "rss too little content",
+                        "word_count": word_count,
+                    }
+
+                kw = keyword.lower().strip()
+                mentions = text.lower().count(kw) if kw else 0
+                snippet = extract_snippet(text, keyword)
+
+                sentences = split_sentences(text)
+                classified = [classify_sentence(s) for s in sentences]
+
+                pain_count = sum(1 for c in classified if c["pain_point"])
+                buying_count = sum(1 for c in classified if c["buying_signal"])
+                question_count = sum(1 for c in classified if c["question"])
+
+                demand_score = score_demand(mentions, pain_count, buying_count, question_count)
+
+                return {
+                    "url": url,
+                    "title": title,
+                    "keyword": keyword,
+                    "domain": clean_domain(url),
+                    "mentions": mentions,
+                    "pain_points": pain_count,
+                    "buying_signals": buying_count,
+                    "questions": question_count,
+                    "demand_score": demand_score,
+                    "snippet": snippet,
+                    "status": "ok",
+                    "word_count": word_count,
+                }
+
+            except Exception as e:
+                return {
+                    "url": url,
+                    "title": url,
+                    "keyword": keyword,
+                    "domain": clean_domain(url),
+                    "mentions": 0,
+                    "pain_points": 0,
+                    "buying_signals": 0,
+                    "questions": 0,
+                    "demand_score": 0,
+                    "snippet": "",
+                    "status": f"rss parse error: {e}",
+                    "word_count": 0,
+                }
+
         if "text/html" not in content_type:
             return {
                 "url": url,
@@ -547,6 +684,11 @@ def crawl_seed_url(seed_url: str, keyword: str, pages_per_site: int = 4, pause_s
     results = []
 
     try:
+        # For Reddit threads, scrape the thread itself first through RSS and skip HTML link crawling.
+        if is_reddit_url(seed_url) and "/comments/" in seed_url:
+            first_row = scrape_single_page(seed_url, keyword)
+            return [first_row]
+
         seed_html = fetch_url(seed_url)
     except Exception as e:
         return [{
