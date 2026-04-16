@@ -108,6 +108,7 @@ for key, default in {
     "discovered_urls": [],
     "raw_mentions": [],
     "dashboard_rows": [],
+    "signal_rows": [],
     "search_error": "",
     "debug_messages": [],
 }.items():
@@ -411,6 +412,51 @@ def classify_sentence(sentence: str) -> dict:
     }
 
 
+def build_signal_rows(sentences: list[str], url: str, title: str, keyword: str, domain: str) -> list[dict]:
+    rows = []
+
+    for sentence in sentences:
+        flags = classify_sentence(sentence)
+
+        if flags["buying_signal"]:
+            rows.append(
+                {
+                    "signal_type": "Buying Signal",
+                    "keyword": keyword,
+                    "domain": domain,
+                    "title": title,
+                    "text": sentence,
+                    "url": url,
+                }
+            )
+
+        if flags["pain_point"]:
+            rows.append(
+                {
+                    "signal_type": "Pain Point",
+                    "keyword": keyword,
+                    "domain": domain,
+                    "title": title,
+                    "text": sentence,
+                    "url": url,
+                }
+            )
+
+        if flags["question"]:
+            rows.append(
+                {
+                    "signal_type": "Question",
+                    "keyword": keyword,
+                    "domain": domain,
+                    "title": title,
+                    "text": sentence,
+                    "url": url,
+                }
+            )
+
+    return rows
+
+
 def tokenize_topics(text: str) -> list[str]:
     words = re.findall(r"[a-zA-Z0-9\+\-]{3,}", text.lower())
     return [w for w in words if w not in STOPWORDS and not w.isdigit()]
@@ -429,9 +475,6 @@ def score_demand(mention_count: int, pain_count: int, buying_count: int, questio
 
 
 def parse_xml_feed(xml_text: str) -> tuple[str, str]:
-    """
-    Return (title, combined_text) from RSS/Atom feed content.
-    """
     root = ET.fromstring(xml_text)
 
     feed_title = ""
@@ -467,7 +510,6 @@ def scrape_single_page(url: str, keyword: str) -> dict:
     try:
         request_url = url
 
-        # Prefer RSS for Reddit thread pages because it is often more reliable than HTML scraping.
         if is_reddit_url(url) and "/comments/" in url and not url.rstrip("/").endswith(".rss"):
             request_url = reddit_rss_url(url)
             log_debug(f"Converted Reddit thread to RSS: {request_url}")
@@ -477,7 +519,6 @@ def scrape_single_page(url: str, keyword: str) -> dict:
 
         content_type = resp.headers.get("Content-Type", "").lower()
 
-        # Handle RSS / Atom / XML feeds as valid content.
         if "xml" in content_type or "rss" in content_type or "atom" in content_type:
             try:
                 feed_title, text = parse_xml_feed(resp.text)
@@ -498,6 +539,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                         "snippet": "",
                         "status": "rss empty",
                         "word_count": 0,
+                        "signal_rows": [],
                     }
 
                 if word_count < 40:
@@ -514,6 +556,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                         "snippet": text[:250],
                         "status": "rss too little content",
                         "word_count": word_count,
+                        "signal_rows": [],
                     }
 
                 kw = keyword.lower().strip()
@@ -528,6 +571,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                 question_count = sum(1 for c in classified if c["question"])
 
                 demand_score = score_demand(mentions, pain_count, buying_count, question_count)
+                signal_rows = build_signal_rows(sentences, url, title, keyword, clean_domain(url))
 
                 return {
                     "url": url,
@@ -542,6 +586,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                     "snippet": snippet,
                     "status": "ok",
                     "word_count": word_count,
+                    "signal_rows": signal_rows,
                 }
 
             except Exception as e:
@@ -558,6 +603,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                     "snippet": "",
                     "status": f"rss parse error: {e}",
                     "word_count": 0,
+                    "signal_rows": [],
                 }
 
         if "text/html" not in content_type:
@@ -574,6 +620,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                 "snippet": "",
                 "status": f"non-html content: {content_type or 'unknown'}",
                 "word_count": 0,
+                "signal_rows": [],
             }
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -601,6 +648,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                     "snippet": text[:250] if text else "",
                     "status": f"blocked page: {signal}",
                     "word_count": word_count,
+                    "signal_rows": [],
                 }
 
         if not text:
@@ -617,6 +665,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                 "snippet": "",
                 "status": "empty page text",
                 "word_count": 0,
+                "signal_rows": [],
             }
 
         if word_count < 80:
@@ -633,6 +682,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
                 "snippet": text[:250],
                 "status": "not enough readable text",
                 "word_count": word_count,
+                "signal_rows": [],
             }
 
         kw = keyword.lower().strip()
@@ -647,6 +697,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
         question_count = sum(1 for c in classified if c["question"])
 
         demand_score = score_demand(mentions, pain_count, buying_count, question_count)
+        signal_rows = build_signal_rows(sentences, url, title, keyword, clean_domain(url))
 
         return {
             "url": url,
@@ -661,6 +712,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
             "snippet": snippet,
             "status": "ok",
             "word_count": word_count,
+            "signal_rows": signal_rows,
         }
 
     except Exception as e:
@@ -677,6 +729,7 @@ def scrape_single_page(url: str, keyword: str) -> dict:
             "snippet": "",
             "status": f"error: {e}",
             "word_count": 0,
+            "signal_rows": [],
         }
 
 
@@ -684,7 +737,6 @@ def crawl_seed_url(seed_url: str, keyword: str, pages_per_site: int = 4, pause_s
     results = []
 
     try:
-        # For Reddit threads, scrape the thread itself first through RSS and skip HTML link crawling.
         if is_reddit_url(seed_url) and "/comments/" in seed_url:
             first_row = scrape_single_page(seed_url, keyword)
             return [first_row]
@@ -704,6 +756,7 @@ def crawl_seed_url(seed_url: str, keyword: str, pages_per_site: int = 4, pause_s
             "snippet": "",
             "status": f"error: {e}",
             "word_count": 0,
+            "signal_rows": [],
         }]
 
     visited = set()
@@ -758,6 +811,15 @@ def summarize_opportunities(df: pd.DataFrame) -> list[str]:
     return insights
 
 
+def flatten_signal_rows(rows: list[dict]) -> list[dict]:
+    flattened = []
+    for row in rows:
+        signal_rows = row.get("signal_rows", [])
+        if signal_rows:
+            flattened.extend(signal_rows)
+    return flattened
+
+
 st.title("Demand Finder")
 st.write("Find where demand is showing up: questions, pain points, and buying signals.")
 
@@ -795,6 +857,7 @@ if st.button("Find Demand", use_container_width=True):
     st.session_state.discovered_urls = []
     st.session_state.raw_mentions = []
     st.session_state.dashboard_rows = []
+    st.session_state.signal_rows = []
     st.session_state.search_error = ""
     st.session_state.debug_messages = []
 
@@ -879,6 +942,7 @@ if st.session_state.discovered_urls:
 
         st.session_state.raw_mentions = raw_rows
         st.session_state.dashboard_rows = raw_rows
+        st.session_state.signal_rows = flatten_signal_rows(raw_rows)
 else:
     st.info("No URLs found yet. Run discovery or add manual URLs.")
 
@@ -899,11 +963,19 @@ if st.session_state.dashboard_rows:
     if ok_df.empty:
         st.warning("No readable discussion pages were found. Check the Scrape Status table above.")
     else:
+        signal_df = pd.DataFrame(st.session_state.signal_rows) if st.session_state.signal_rows else pd.DataFrame(
+            columns=["signal_type", "keyword", "domain", "title", "text", "url"]
+        )
+
+        buying_signal_df = signal_df[signal_df["signal_type"] == "Buying Signal"].copy() if not signal_df.empty else signal_df
+        pain_point_df = signal_df[signal_df["signal_type"] == "Pain Point"].copy() if not signal_df.empty else signal_df
+        question_df = signal_df[signal_df["signal_type"] == "Question"].copy() if not signal_df.empty else signal_df
+
         metric1, metric2, metric3, metric4 = st.columns(4)
         metric1.metric("Pages analyzed", len(ok_df))
-        metric2.metric("Buying signals", int(ok_df["buying_signals"].sum()))
-        metric3.metric("Pain points", int(ok_df["pain_points"].sum()))
-        metric4.metric("Questions", int(ok_df["questions"].sum()))
+        metric2.metric("Buying signals", len(buying_signal_df))
+        metric3.metric("Pain points", len(pain_point_df))
+        metric4.metric("Questions", len(question_df))
 
         domain_rollup = (
             ok_df.groupby("domain", dropna=False)
@@ -938,7 +1010,9 @@ if st.session_state.dashboard_rows:
             columns=["topic", "count"]
         )
 
-        tab1, tab2, tab3, tab4 = st.tabs(["Opportunities", "Domains", "Keywords", "Raw Mentions"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(
+            ["Opportunities", "Signals", "Domains", "Keywords", "Raw Mentions"]
+        )
 
         with tab1:
             for insight in summarize_opportunities(ok_df):
@@ -955,12 +1029,53 @@ if st.session_state.dashboard_rows:
             st.dataframe(top_pages, use_container_width=True, hide_index=True)
 
         with tab2:
-            st.dataframe(domain_rollup, use_container_width=True, hide_index=True)
+            st.markdown("### Signal Explorer")
+
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                st.markdown(f"**Buying Signals:** {len(buying_signal_df)}")
+            with s2:
+                st.markdown(f"**Pain Points:** {len(pain_point_df)}")
+            with s3:
+                st.markdown(f"**Questions:** {len(question_df)}")
+
+            with st.expander(f"Buying Signals ({len(buying_signal_df)})", expanded=True):
+                if buying_signal_df.empty:
+                    st.info("No buying signal text found.")
+                else:
+                    st.dataframe(
+                        buying_signal_df[["keyword", "domain", "title", "text", "url"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            with st.expander(f"Pain Points ({len(pain_point_df)})"):
+                if pain_point_df.empty:
+                    st.info("No pain point text found.")
+                else:
+                    st.dataframe(
+                        pain_point_df[["keyword", "domain", "title", "text", "url"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            with st.expander(f"Questions ({len(question_df)})"):
+                if question_df.empty:
+                    st.info("No question text found.")
+                else:
+                    st.dataframe(
+                        question_df[["keyword", "domain", "title", "text", "url"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
         with tab3:
-            st.dataframe(keyword_rollup, use_container_width=True, hide_index=True)
+            st.dataframe(domain_rollup, use_container_width=True, hide_index=True)
 
         with tab4:
+            st.dataframe(keyword_rollup, use_container_width=True, hide_index=True)
+
+        with tab5:
             raw_view = ok_df[[
                 "keyword", "domain", "title", "mentions",
                 "pain_points", "buying_signals", "questions",
@@ -975,3 +1090,12 @@ if st.session_state.dashboard_rows:
             file_name="demand_finder_results.csv",
             mime="text/csv",
         )
+
+        if not signal_df.empty:
+            signal_csv = signal_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download Signal Text CSV",
+                data=signal_csv,
+                file_name="demand_finder_signal_text.csv",
+                mime="text/csv",
+            )
