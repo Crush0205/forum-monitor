@@ -19,16 +19,8 @@ DEFAULT_URLS = [
 ]
 
 DEFAULT_KEYWORDS = [
-    "radiator",
     "intercooler",
-    "transmission cooler",
-    "oil cooler",
-    "cooling",
-    "overheating",
-    "mishimoto",
-    "recommend",
-    "problem",
-    "issue",
+ 
 ]
 
 USER_AGENT = "web:forum-monitor:v1.0 (by /u/your_reddit_username)"
