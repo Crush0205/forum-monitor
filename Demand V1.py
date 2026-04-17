@@ -1,12 +1,13 @@
 import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
 from bs4 import BeautifulSoup
 
 DEFAULT_URLS = [
-    "https://www.reddit.com/r/FordMaverickTruck/new/.rss",
-    "https://www.reddit.com/r/FordMaverickTruckMods/new/.rss",
+    "https://www.reddit.com/r/FordMaverickTruck/search/?q=intercooler",
+    "https://www.reddit.com/r/FordMaverickTruck/new/",
+    "https://www.reddit.com/r/FordMaverickTruckMods/new/",
     "https://www.mavericktruckclub.com/forum/",
     "https://www.maverickchat.com/forums/2022-ford-maverick-general-discussion-forum.8/",
 ]
@@ -29,13 +30,13 @@ USER_AGENT = "web:forum-monitor:v1.0 (by /u/your_reddit_username)"
 
 st.set_page_config(page_title="Forum Monitor", layout="wide")
 st.title("Forum Monitor")
-st.write("Add RSS feeds or forum URLs, then scan for keyword matches.")
+st.write("Add Reddit URLs, RSS feeds, or forum URLs, then scan for keyword matches.")
 
 
 url_text = st.text_area(
     "URLs to check (one per line)",
     value="\n".join(DEFAULT_URLS),
-    height=180,
+    height=200,
 )
 
 keyword_text = st.text_area(
@@ -59,11 +60,113 @@ def match_keyword(text: str, keywords: list[str]) -> str | None:
     return None
 
 
-def fetch_url(url: str) -> str:
+def is_reddit_url(url: str) -> bool:
+    netloc = urlparse(url).netloc.lower()
+    return "reddit.com" in netloc or "redd.it" in netloc
+
+
+def to_reddit_rss_url(url: str) -> str:
+    """
+    Convert common Reddit URLs into RSS equivalents when possible.
+
+    Examples:
+    - /r/FordMaverickTruck/new/ -> /r/FordMaverickTruck/new/.rss
+    - /r/FordMaverickTruck/search/?q=intercooler -> /r/FordMaverickTruck/search.rss?q=intercooler
+    - /r/FordMaverickTruck/new.json?limit=50 -> /r/FordMaverickTruck/new/.rss
+    """
+    parsed = urlparse(url)
+    netloc = parsed.netloc or "www.reddit.com"
+    path = parsed.path or "/"
+    query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    query = dict(query_pairs)
+
+    if parsed.scheme not in ("http", "https"):
+        return url
+
+    if "reddit.com" not in netloc.lower():
+        return url
+
+    # Already RSS
+    if path.endswith(".rss") or "/.rss" in path or "/rss" in path:
+        return url
+
+    clean_path = path.rstrip("/")
+
+    # Search pages
+    # /r/sub/search or /search
+    if clean_path.endswith("/search"):
+        rss_path = clean_path[:-7] + "/search.rss"
+
+        # Helpful defaults for subreddit search if user pasted browser URL
+        if "restrict_sr" not in query and "/r/" in clean_path:
+            query["restrict_sr"] = "1"
+        if "sort" not in query:
+            query["sort"] = "new"
+
+        return urlunparse(
+            (
+                "https",
+                "www.reddit.com",
+                rss_path,
+                "",
+                urlencode(query, doseq=True),
+                "",
+            )
+        )
+
+    # .json listing endpoints -> RSS listing
+    if clean_path.endswith(".json"):
+        clean_path = clean_path[:-5]
+
+    # Common Reddit listing paths
+    listing_endings = [
+        "/new",
+        "/hot",
+        "/top",
+        "/rising",
+        "/controversial",
+    ]
+
+    for ending in listing_endings:
+        if clean_path.endswith(ending):
+            rss_path = clean_path + "/.rss"
+            return urlunparse(
+                (
+                    "https",
+                    "www.reddit.com",
+                    rss_path,
+                    "",
+                    urlencode(query, doseq=True),
+                    "",
+                )
+            )
+
+    # Plain subreddit URL -> default to new feed
+    parts = [p for p in clean_path.split("/") if p]
+    if len(parts) >= 2 and parts[0] == "r":
+        subreddit = parts[1]
+        rss_path = f"/r/{subreddit}/new/.rss"
+        return urlunparse(
+            (
+                "https",
+                "www.reddit.com",
+                rss_path,
+                "",
+                urlencode(query, doseq=True),
+                "",
+            )
+        )
+
+    # Fallback to original
+    return url
+
+
+def fetch_url(url: str) -> tuple[str, str]:
+    final_url = to_reddit_rss_url(url) if is_reddit_url(url) else url
     headers = {"User-Agent": USER_AGENT}
-    response = requests.get(url, headers=headers, timeout=20)
+    response = requests.get(final_url, headers=headers, timeout=20)
     response.raise_for_status()
-    return response.text
+    return response.text, final_url
 
 
 def parse_rss(xml_text: str) -> list[dict]:
@@ -132,7 +235,7 @@ def parse_html(base_url: str, html: str) -> list[dict]:
         if href.startswith(bad_starts):
             continue
 
-        # Keep links on the same site only
+        # Keep links on same site only
         if urlparse(full_link).netloc != urlparse(base_url).netloc:
             continue
 
@@ -172,7 +275,7 @@ def parse_html(base_url: str, html: str) -> list[dict]:
 
 def parse_content(url: str, content: str) -> list[dict]:
     lower_url = url.lower()
-    if lower_url.endswith(".rss") or "/rss" in lower_url:
+    if lower_url.endswith(".rss") or "/.rss" in lower_url or "/rss" in lower_url:
         return parse_rss(content)
     return parse_html(url, content)
 
@@ -183,10 +286,10 @@ if st.button("Scan URLs"):
 
     results = []
 
-    for url in urls:
+    for original_url in urls:
         try:
-            content = fetch_url(url)
-            items = parse_content(url, content)
+            content, fetched_url = fetch_url(original_url)
+            items = parse_content(fetched_url, content)
 
             for item in items:
                 combined_text = f'{item.get("title", "")} {item.get("body", "")}'
@@ -195,7 +298,8 @@ if st.button("Scan URLs"):
                 if keyword:
                     results.append(
                         {
-                            "source": label_from_url(url),
+                            "source": label_from_url(original_url),
+                            "fetched_url": fetched_url,
                             "keyword": keyword,
                             "title": item.get("title", "Match found"),
                             "link": item.get("link", ""),
@@ -204,7 +308,7 @@ if st.button("Scan URLs"):
                     )
 
         except Exception as e:
-            st.error(f"Error checking {url}: {e}")
+            st.error(f"Error checking {original_url}: {e}")
 
     if results:
         st.success(f"Found {len(results)} matches")
@@ -213,6 +317,10 @@ if st.button("Scan URLs"):
             st.subheader(item["title"])
             st.write(f'**Source:** {item["source"]}')
             st.write(f'**Keyword:** {item["keyword"]}')
+            if is_reddit_url(item["fetched_url"]) and item["fetched_url"] != item["source"]:
+                st.caption(f'Fetched via: {item["fetched_url"]}')
+            elif item["fetched_url"]:
+                st.caption(f'Fetched via: {item["fetched_url"]}')
             if item["snippet"]:
                 st.write(item["snippet"])
             if item["link"]:
